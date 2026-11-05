@@ -1,0 +1,129 @@
+# scpatch — run ScreenConnect's security database on SQL Server
+
+ScreenConnect generates SQL with **bare column names**. `Key` is a reserved word in T-SQL,
+so every statement that touches `SecurityConfiguration.Key` is rejected:
+
+```
+Msg 156, Level 15: Incorrect syntax near the keyword 'Key'.
+```
+
+With the security database pointed at SQL Server, `ServerCryptoManager..ctor()` can never
+load the application keys, so the whole site answers HTTP 500. This tool fixes that at the
+binary level, and works on any ScreenConnect build that has the same data layer.
+
+## How it works
+
+Two pieces, both dropped into `Bin`:
+
+1. **`ScreenConnect.Server.dll` (patched)** — one `call` is injected at the top of
+   `ScreenConnect.DbExtensions.CreateCommand(DbConnection, string, object[])`. In this
+   assembly that method contains the *only* `DbCommand.CommandText` assignment, so every
+   SQL statement in the product passes through it.
+
+2. **`ScreenConnect.SqlFixer.dll` (helper)** — takes that SQL text and brackets reserved
+   identifiers (`Key`, `Value`) when — and only when — the connection is a `SqlConnection`.
+   It skips string literals, `@parameters`, already-bracketed names, qualified names
+   (`a.Key`), comments, and the `PRIMARY KEY` / `FOREIGN KEY` syntax.
+
+Bracketing is done on the **text that is executed**, not in the schema definitions. That
+detail matters: ScreenConnect compares `ColumnDefinition.ColumnName` against the live
+database to decide whether to `ALTER TABLE`. If the definitions said `[Key]` while SQL
+Server reports `Key`, it would try to add a duplicate column (`Msg 2705`). Keeping the
+definitions plain keeps that comparison happy.
+
+## Requirements
+
+- .NET 8 runtime to run the tool (`dotnet scpatch.dll`)
+- .NET Framework 4.x on the target (any ScreenConnect 26.x)
+- Mono's `mcs` or the .NET Framework compiler to rebuild the fixer (a prebuilt signed
+  `ScreenConnect.SqlFixer.dll` is included)
+
+## Usage
+
+```
+dotnet scpatch.dll report <in.dll> <out.tsv>
+dotnet scpatch.dll hook   <in.dll> <out.dll> --fixer <ScreenConnect.SqlFixer.dll>
+dotnet scpatch.dll patch  <in.dll> <out.dll> [--verbose] [--extra-ident NAME]
+dotnet scpatch.dll il     <dll> [type] [method] [count]
+```
+
+- `report` — decrypts the obfuscated string table and dumps every call site
+  (`type`, `method`, `kind`, `index`, `key`, `plain`). Useful to confirm the build is
+  recognisable before changing anything.
+- `hook` — **the recommended mode.** Injects the `SqlFixer.Fix(connection, sql)` call.
+- `patch` — legacy mode: rewrites the decrypted SQL strings themselves. Keeps schema
+  definitions intact but cannot reach SQL that is assembled at runtime from column
+  definitions (e.g. the `SELECT` column list), so `hook` is preferred.
+- `il` — dumps the first N IL instructions of a method plus the module's assembly refs.
+  Handy to verify the injection.
+
+### Patching a different ScreenConnect version
+
+1. Get the version that is **actually installed** — the patched file must match it or the
+   service fails with `FileLoadException`:
+
+   ```powershell
+   (Get-Item 'C:\Program Files (x86)\ScreenConnect\Bin\ScreenConnect.Server.dll').VersionInfo.FileVersion
+   ```
+
+2. Copy that DLL to a work folder.
+3. `dotnet scpatch.dll report ScreenConnect.Server.dll sites.tsv` — you should see the
+   `SecurityDatabase::.cctor` rows and ` WHERE Key = @A`; if the table resolves, the build
+   uses the same obfuscator.
+4. `dotnet scpatch.dll hook ScreenConnect.Server.dll out.dll --fixer ScreenConnect.SqlFixer.dll`
+5. Deploy (below).
+
+The tool locates the code by structure, not by offsets: it finds the `Lazy<string[]>[]`
+string table, the decryptor call sites, and `CreateCommand` by signature. That is what makes
+it portable across builds.
+
+## Deployment
+
+`deploy/install-patch.ps1` is a template — edit the two source paths at the top, then run it
+elevated. In short:
+
+```powershell
+# stop all four (they share ONE process)
+'ScreenConnect Web Server','ScreenConnect Session Manager',
+'ScreenConnect Security Manager','ScreenConnect Relay' | Stop-Service -Force
+Start-Sleep 8
+
+Copy-Item .\ScreenConnect.Server.dll  'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
+Copy-Item .\ScreenConnect.SqlFixer.dll 'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
+
+# start again (one process serves all four roles)
+'ScreenConnect Security Manager','ScreenConnect Session Manager',
+'ScreenConnect Relay','ScreenConnect Web Server' | Start-Service
+```
+
+The patched assembly is loaded from `Bin` with the same identity (name, version, public key
+token) as the original, so nothing else needs to change.
+
+## Notes and caveats
+
+- **Strong name.** `ScreenConnect.Server.dll` is strong-named; rewriting it invalidates the
+  signature. .NET Framework skips strong-name *verification* for full-trust assemblies
+  loaded from the application directory, so it loads — that is what makes this work.
+  Keep the original as `ScreenConnect.Server.dll.orig` for rollback.
+- **The helper must be strong-named.** A strong-named assembly cannot reference an unsigned
+  one here; without a key the CLR fails with
+  `Could not load ... ScreenConnect.SqlFixer ... A strongly-named assembly is required`
+  (`0x80131044`) and the service crashes at startup. `fixer.snk` is included; rebuild with
+  `mcs -target:library -sdk:4.5 -keyfile:fixer.snk -out:ScreenConnect.SqlFixer.dll Fixer.cs`.
+  Changing the key changes the public key token, which then requires re-running `hook`.
+- **Re-run after every upgrade.** A ScreenConnect update replaces both the DLL and its
+  version; re-patch the new file.
+- **Schema.** The `SecurityConfiguration` table must already exist on SQL Server with a
+  usable primary key (`[Key] nvarchar(450) NOT NULL PRIMARY KEY`), because ScreenConnect's
+  own DDL uses `nvarchar(MAX)` as a key, which SQL Server rejects (`Msg 1919`).
+- **Keys.** `ApplicationDecryptionKey` / `ApplicationValidationKey` in `SecurityConfiguration`
+  are DPAPI blobs bound to the machine. When moving from SQLite, copy the two rows across as
+  they are; if they are regenerated, previously encrypted configuration can no longer be read.
+- **Diagnostics.** The fixer logs every rewrite to `C:\Temp\scsqlfix.log`, but only when the
+  marker file `C:\Temp\scsqlfix.enable` exists. Delete the marker to go quiet.
+
+## Verified on
+
+- ScreenConnect 26.6.6.9747, Windows Server 2025
+- SQL Server 2019 Express, security database `ScreenConnect_Security`
+- `/` 200, `/Login` 200, `/Administration` 302, keys loaded from SQL Server

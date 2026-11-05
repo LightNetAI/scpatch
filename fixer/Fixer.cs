@@ -47,9 +47,18 @@ namespace ScreenConnect
             // bare identifiers and Oracle would reject brackets.
             if (connection == null) return sql;
             if (!connection.GetType().Name.StartsWith("SqlConnection", StringComparison.Ordinal)) return sql;
+            if (!LooksLikeSql(sql)) return sql;
+
+            // Report engine constructs that SQLite accepts and SQL Server rejects.
+            string rewritten = SqlRewrite.Apply(sql);
+            if (!string.Equals(rewritten, sql, StringComparison.Ordinal))
+            {
+                Log("REWRITE IN : " + sql + "\nREWRITE OUT: " + rewritten);
+                sql = rewritten;
+            }
+
             if (sql.IndexOf("Key", StringComparison.OrdinalIgnoreCase) < 0 &&
                 sql.IndexOf("Value", StringComparison.OrdinalIgnoreCase) < 0) return sql;
-            if (!LooksLikeSql(sql)) return sql;
 
             StringBuilder sb = new StringBuilder(sql.Length + 32);
             string prevWord = null;

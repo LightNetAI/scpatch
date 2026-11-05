@@ -127,3 +127,46 @@ token) as the original, so nothing else needs to change.
 - ScreenConnect 26.6.6.9747, Windows Server 2025
 - SQL Server 2019 Express, security database `ScreenConnect_Security`
 - `/` 200, `/Login` 200, `/Administration` 302, keys loaded from SQL Server
+
+## SQL Server report fixes
+
+ScreenConnect's built-in report engine generates SQL that SQLite accepts and SQL Server
+rejects. Two shapes are rewritten by the fixer (`fixer/SqlRewrite.cs`), and only when the
+exact pattern is present, so ordinary queries pass through untouched.
+
+**1. Aggregate/subquery expressions in `GROUP BY`** (`Msg 164`)
+
+The engine reuses the select expressions as group keys. For computed report columns such as
+`SessionName` or `ConnectedTime` those expressions are correlated scalar subqueries:
+
+```sql
+GROUP BY ParticipantName,
+         (SELECT Name FROM Session WHERE SessionID = SessionConnection.SessionID),
+         (SELECT MIN(Time) FROM SessionEvent WHERE ... EventType = 10)
+```
+
+The rewrite hoists the select list into a derived table and groups on its plain columns:
+
+```sql
+SELECT ParticipantName, SessionName, ConnectedTime, SUM(__scagg3) AS TotalDurationSeconds
+FROM (SELECT ParticipantName AS ParticipantName,
+             (SELECT Name FROM Session ...) AS SessionName,
+             (SELECT MIN(Time) FROM SessionEvent ... EventType = 10) AS ConnectedTime,
+             DATEDIFF_BIG(microsecond, ...) / 1000000 AS __scagg3
+      FROM SessionConnection WHERE ProcessType=1) AS __sc
+GROUP BY ParticipantName, SessionName, ConnectedTime
+ORDER BY ParticipantName, SessionName, ConnectedTime
+```
+
+**2. Duration arithmetic written for SQLite ticks** (`Msg 8117`)
+
+`TotalDurationSeconds` is emitted as `(MAX(Time) - MIN(Time)) / 10000000`. That only works
+when `Time` is stored as .NET ticks, which is what SQLite does. On SQL Server the column is
+`datetime2` and `DateTimeConverter` calls `dataRecord.GetDateTime()`, so the column type is
+correct and the *arithmetic* is wrong. It is rewritten to
+`DATEDIFF_BIG(microsecond, MIN, MAX) / 1000000`, which reproduces the tick division exactly
+(verified against live data: 26789 s for a session whose stored duration is 26789 s).
+
+Both rewrites are logged to `C:\Temp\scsqlfix.log` when the marker file
+`C:\Temp\scsqlfix.enable` exists. A rewrite that does not parse cleanly is abandoned and the
+original SQL is returned unchanged.

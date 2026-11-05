@@ -27,6 +27,6 @@ ls "$REF"/*.dll | sed 's/^/-r:/' > /tmp/scpatch-refs.rsp
 
 # Strong name is mandatory: a strong-named assembly cannot reference an unsigned one.
 mcs -target:library -sdk:4.5 -keyfile:fixer/fixer.snk \
-    -out:fixer/ScreenConnect.SqlFixer.dll fixer/Fixer.cs
+    -out:fixer/ScreenConnect.SqlFixer.dll fixer/Fixer.cs fixer/SqlRewrite.cs
 
 echo "built bin/scpatch.dll and fixer/ScreenConnect.SqlFixer.dll"

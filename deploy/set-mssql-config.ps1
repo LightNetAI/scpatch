@@ -14,14 +14,14 @@
 
     Example:
       .\set-mssql-config.ps1 `
-        -SessionConnectionString  "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
-        -SecurityConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True"
+        -SessionConnectionString  "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True" `
+        -SecurityConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
 
     Hybrid - SQL Server for sessions, the original SQLite file for security
     (this is the configuration that runs without patching ScreenConnect.Server.dll):
 
       .\set-mssql-config.ps1 `
-        -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
+        -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True" `
         -SecuritySqlite
 #>
 [CmdletBinding()]

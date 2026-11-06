@@ -107,13 +107,39 @@ invariant name of the built-in SQL Server provider:
 ```xml
 <connectionStrings>
   <add name="SessionDatabase"
-       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
        providerName="System.Data.SqlClient" />
   <add name="SecurityDatabase"
-       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
        providerName="System.Data.SqlClient" />
 </connectionStrings>
 ```
+
+### The SQL Server login
+
+Use SQL authentication rather than `Integrated Security=True`. The four services run as
+`LocalSystem`, so integrated security authenticates as the machine account (`MACHINE$`), which
+then needs a login of its own on the instance; a SQL login is independent of the service
+identity and keeps working if the services later run under another account.
+
+```powershell
+# once, as a sysadmin - change the password in the script first
+sqlcmd -S .\SQLEXPRESS -E -i .\create-sql-login.sql
+```
+
+`deploy\create-sql-login.sql` creates the login, maps it into `ScreenConnect` and
+`ScreenConnect_Security`, and adds it to `db_owner` on both. It creates the databases too; if
+you would rather let `sqlite2mssql.exe --create-database` do that, grant the login `dbcreator`
+instead (the commented line in the script).
+
+Connection-string options that matter:
+
+- `MultipleActiveResultSets=True` — ScreenConnect's data layer issues concurrent commands on a
+  single connection; this is part of the tested configuration.
+- `TrustServerCertificate=True` — needed when the instance uses a self-signed certificate (the
+  default) and the client negotiates encryption.
+- The password sits in plain text in `web.config`; restrict that file's ACL to Administrators
+  and the service account.
 
 `deploy\set-mssql-config.ps1` performs that edit safely. The four ScreenConnect services share
 one process and hold `web.config` open, so it stops them, writes a timestamped backup, writes
@@ -122,8 +148,8 @@ to a temporary file and moves it into place (a direct write can leave a zero-byt
 
 ```powershell
 .\set-mssql-config.ps1 -WhatIf `
-  -SessionConnectionString  "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
-  -SecurityConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True"
+  -SessionConnectionString  "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True" `
+  -SecurityConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
 ```
 
 Drop `-WhatIf` to apply. `-KeepServicesStopped` leaves them down for a follow-up step.
@@ -138,11 +164,11 @@ download and no `sqlite3.dll` to install — only an existing ScreenConnect inst
 ```powershell
 # stop the four services first
 .\sqlite2mssql.exe --db "C:\Program Files (x86)\ScreenConnect\App_Data\Session.db" `
-    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
+    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True" `
     --create-database
 
 .\sqlite2mssql.exe --db "C:\Program Files (x86)\ScreenConnect\App_Data\Security.db" `
-    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True" `
+    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True" `
     --create-database
 ```
 
@@ -182,7 +208,7 @@ SQLite file avoids it, while the large database — sessions and events — move
 ```xml
 <connectionStrings>
   <add name="SessionDatabase"
-       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
        providerName="System.Data.SqlClient" />
   <add name="SecurityDatabase"
        connectionString="Data Source=|DataDirectory|/Security.db; DateTimeKind=Utc; Foreign Keys=true; Page Size=4096; Journal Mode=WAL; BaseSchemaName=; Cache Size=1000; Memory Mapped Size=10000000000; DateTimeFormat=Ticks"
@@ -195,7 +221,7 @@ byte-for-byte as ScreenConnect installs it:
 
 ```powershell
 .\set-mssql-config.ps1 -SecuritySqlite `
-  -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+  -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
 ```
 
 Copy `App_Data\Session.db` into SQL Server first with `sqlite2mssql.exe`; the security file

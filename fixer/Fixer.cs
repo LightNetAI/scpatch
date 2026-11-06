@@ -27,6 +27,15 @@ namespace ScreenConnect
             "Value",
         };
 
+        // ScreenConnect's tamper check (ScreenConnect.ServerExtensions.HaveFilesBeenTamperedWith)
+        // hashes its own files. A patched Server.dll always mismatches, and the relay is
+        // the only service that acts on it -- it ends its run and restart-loops every few
+        // seconds. scpatch rewrites that method to call this instead.
+        public static System.Threading.Tasks.Task<bool> NotTampered()
+        {
+            return System.Threading.Tasks.Task.FromResult(false);
+        }
+
         public static string Fix(object connection, string sql)
         {
             try

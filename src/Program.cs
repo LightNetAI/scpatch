@@ -371,6 +371,9 @@ static class Program
         foreach (var m in fixerType.Methods)
             if (m.Name == "Fix" && m.IsStatic && m.MethodSig.Params.Count == 2) { fix = m; break; }
         if (fix == null) { Console.Error.WriteLine("[!] Fixer.Fix(object,string) not found"); return 3; }
+        MethodDef notTampered = null;
+        foreach (var m in fixerType.Methods)
+            if (m.Name == "NotTampered" && m.IsStatic && m.MethodSig.Params.Count == 0) { notTampered = m; break; }
 
         var targetType = mod.Find("ScreenConnect.DbExtensions", false);
         if (targetType == null) { Console.Error.WriteLine("[!] ScreenConnect.DbExtensions not found"); return 5; }
@@ -405,6 +408,46 @@ static class Program
 
         Console.WriteLine("[i] hooked " + target.FullName);
         Console.WriteLine("[i]   -> " + imported.FullName);
+
+        // ScreenConnect ships an encrypted manifest of its own file hashes and
+        // verifies it on a timer. A patched Server.dll therefore reports as
+        // "tampered with", and the relay -- the only service built on
+        // SocketServer -- ends its run when the check trips (~5 s restart loop).
+        // Force the check to report clean so the relay keeps running.
+        MethodDef tamper = null;
+        var serverExtensions = mod.Find("ScreenConnect.ServerExtensions", false);
+        if (serverExtensions != null)
+        {
+            foreach (var m in serverExtensions.Methods)
+                if (m.Name == "HaveFilesBeenTamperedWith" && m.IsStatic && m.MethodSig.Params.Count == 0) { tamper = m; break; }
+        }
+        if (tamper != null && tamper.HasBody)
+        {
+            // Call into the fixer instead of emitting a generic Task.FromResult call:
+            // the fixer is ordinary C#, so the compiler gets the signature right.
+            if (notTampered == null)
+            {
+                Console.WriteLine("[!] ScreenConnect.SqlFixer.NotTampered() missing; cannot neutralize tamper check");
+            }
+            else
+            {
+            var importedNotTampered = mod.Import(notTampered);
+            var tb = tamper.Body;
+            tb.ExceptionHandlers.Clear();
+            tb.Variables.Clear();
+            tb.Instructions.Clear();
+            tb.Instructions.Add(Instruction.Create(OpCodes.Call, importedNotTampered));
+            tb.Instructions.Add(Instruction.Create(OpCodes.Ret));
+            tb.InitLocals = false;
+            tb.MaxStack = 1;
+            tb.UpdateInstructionOffsets();
+            Console.WriteLine("[i] neutralized " + tamper.FullName + " (tamper check -> false)");
+            }
+        }
+        else
+        {
+            Console.WriteLine("[!] HaveFilesBeenTamperedWith not found; the relay may restart-loop");
+        }
 
         var opts = new ModuleWriterOptions(mod);
         opts.MetadataOptions.Flags |= MetadataFlags.KeepOldMaxStack;

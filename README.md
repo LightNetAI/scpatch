@@ -99,6 +99,37 @@ Copy-Item .\ScreenConnect.SqlFixer.dll 'C:\Program Files (x86)\ScreenConnect\Bin
 The patched assembly is loaded from `Bin` with the same identity (name, version, public key
 token) as the original, so nothing else needs to change.
 
+## SQL Server checklist
+
+Two things outside the DLL are easy to miss, and both fail in ways that look unrelated.
+
+**1. `providerName` must change with the connection string.**
+
+Each connection string in `web.config` carries a `providerName` attribute. Rewriting only
+`connectionString` leaves `providerName="SQLite"`, so ScreenConnect keeps using its embedded
+SQLite engine and treats the SQL Server data source as a *file*. Procmon shows it plainly:
+
+```
+CreateFile  C:\WINDOWS\system32\127.0.0.1\CWControl   PATH NOT FOUND   (325x)
+```
+
+and the service log fills with `SQLiteException: unable to open database file`. Set both
+entries to `providerName="System.Data.SqlClient"`.
+
+**2. ScreenConnect checks its own file hashes, and the relay acts on the result.**
+
+`ScreenConnect.ServerExtensions.HaveFilesBeenTamperedWith()` compares the installed files
+against an encrypted manifest shipped with the product. A patched `ScreenConnect.Server.dll`
+always mismatches. The web tier ignores that; the relay does not — it ends its socket run and
+restart-loops with `Service run ended prematurely`, so the relay listens but no agent can
+connect. The check runs on a timer, so the loop may not start until several minutes after
+launch.
+
+`scpatch hook` therefore also rewrites `HaveFilesBeenTamperedWith` to call
+`ScreenConnect.SqlFixer.NotTampered()` (which returns `Task.FromResult(false)`). The relay
+then stays up. Because the check is timer-driven, test for at least five minutes before
+declaring a build good.
+
 ## Notes and caveats
 
 - **Strong name.** `ScreenConnect.Server.dll` is strong-named; rewriting it invalidates the

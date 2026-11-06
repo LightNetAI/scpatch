@@ -173,6 +173,50 @@ Notes:
 - `tools\SqliteToMssql\build.ps1` rebuilds the executable with the in-box .NET Framework
   compiler if you prefer to compile it yourself.
 
+## Hybrid: SQL Server for sessions, SQLite for security
+
+This configuration needs **no patch at all**. The reserved-word problem (`Key` in
+`SecurityConfiguration`) lives in the security database, so leaving security on the original
+SQLite file avoids it, while the large database — sessions and events — moves to SQL Server.
+
+```xml
+<connectionStrings>
+  <add name="SessionDatabase"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+       providerName="System.Data.SqlClient" />
+  <add name="SecurityDatabase"
+       connectionString="Data Source=|DataDirectory|/Security.db; DateTimeKind=Utc; Foreign Keys=true; Page Size=4096; Journal Mode=WAL; BaseSchemaName=; Cache Size=1000; Memory Mapped Size=10000000000; DateTimeFormat=Ticks"
+       providerName="SQLite" />
+</connectionStrings>
+```
+
+`deploy\set-mssql-config.ps1 -SecuritySqlite` writes exactly that, keeping the SQLite string
+byte-for-byte as ScreenConnect installs it:
+
+```powershell
+.\set-mssql-config.ps1 -SecuritySqlite `
+  -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+```
+
+Copy `App_Data\Session.db` into SQL Server first with `sqlite2mssql.exe`; the security file
+stays where it is and needs no migration.
+
+Verified on a running install with the **stock, unpatched** `ScreenConnect.Server.dll`:
+`/` 200, `/Login` 200, relay up across the full tamper-check interval with zero restarts,
+21 agents connected, sessions updating.
+
+Things to keep in mind:
+
+- `App_Data\Security.db` is load-bearing again — it holds the DPAPI keys and the
+  `SecurityConfiguration` rows. Back it up, and copy it if you move the installation.
+- The SQL Server database used for security (`ScreenConnect_Security`) is no longer touched
+  and can be dropped.
+- After switching, the SQLite `Session.db` is ignored; keep it as a rollback.
+- Reports that query the session database still hit the shapes described under
+  "SQL Server report fixes" (`Msg 164`, `Msg 8117`), because those queries now run on SQL
+  Server. If you depend on those reports, patch; for agent, relay and web operation you do
+  not need to.
+
 ## SQL Server checklist
 
 Two things outside the DLL are easy to miss, and both fail in ways that look unrelated.

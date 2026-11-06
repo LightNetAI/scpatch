@@ -1,103 +1,77 @@
-# scpatch — run ScreenConnect's security database on SQL Server
+# scpatch — ScreenConnect on SQL Server
 
-ScreenConnect generates SQL with **bare column names**. `Key` is a reserved word in T-SQL,
-so every statement that touches `SecurityConfiguration.Key` is rejected:
+ScreenConnect installs with both of its databases in SQLite. This repository moves them to
+SQL Server, in whichever shape fits:
 
+| Layout | Session database | Security database | Patch needed |
+|---|---|---|---|
+| **Hybrid — first choice** | SQL Server | SQLite | **No** |
+| Full SQL Server | SQL Server | SQL Server | Yes |
+| Reports on a SQL Server session database | SQL Server | either | Yes, for the report SQL |
+
+The **hybrid** comes first below and is where most installations should stop: the session
+database — the one that grows with events and connections — moves to SQL Server, while the
+security database stays on the SQLite file the installer created. Nothing in the product is
+modified, so a repair or upgrade cannot undo it.
+
+The **patch** exists for the two things the hybrid cannot do:
+
+- **Put the security database on SQL Server.** ScreenConnect generates SQL with bare column
+  names, and `Key` is reserved in T-SQL, so `ServerCryptoManager..ctor()` can never load the
+  application keys and the whole site answers HTTP 500:
+
+  ```
+  Msg 156, Level 15: Incorrect syntax near the keyword 'Key'.
+  ```
+
+- **Run ScreenConnect reports against a SQL Server session database.** The report engine
+  emits SQL that SQLite accepts and T-SQL rejects (`Msg 164`, `Msg 8117`).
+
+Both layouts share the same web.config and migration steps. Those come first, the patch last.
+
+## Hybrid: SQL Server for sessions, SQLite for security (recommended)
+
+This configuration needs **no patch at all**. The reserved-word problem (`Key` in
+`SecurityConfiguration`) lives in the security database, so leaving security on the original
+SQLite file avoids it, while the large database — sessions and events — moves to SQL Server.
+
+```xml
+<connectionStrings>
+  <add name="SessionDatabase"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
+       providerName="System.Data.SqlClient" />
+  <add name="SecurityDatabase"
+       connectionString="Data Source=|DataDirectory|/Security.db; DateTimeKind=Utc; Foreign Keys=true; Page Size=4096; Journal Mode=WAL; BaseSchemaName=; Cache Size=1000; Memory Mapped Size=10000000000; DateTimeFormat=Ticks"
+       providerName="SQLite" />
+</connectionStrings>
 ```
-Msg 156, Level 15: Incorrect syntax near the keyword 'Key'.
-```
 
-With the security database pointed at SQL Server, `ServerCryptoManager..ctor()` can never
-load the application keys, so the whole site answers HTTP 500. This tool fixes that at the
-binary level, and works on any ScreenConnect build that has the same data layer.
-
-## How it works
-
-Two pieces, both dropped into `Bin`:
-
-1. **`ScreenConnect.Server.dll` (patched)** — one `call` is injected at the top of
-   `ScreenConnect.DbExtensions.CreateCommand(DbConnection, string, object[])`. In this
-   assembly that method contains the *only* `DbCommand.CommandText` assignment, so every
-   SQL statement in the product passes through it.
-
-2. **`ScreenConnect.SqlFixer.dll` (helper)** — takes that SQL text and brackets reserved
-   identifiers (`Key`, `Value`) when — and only when — the connection is a `SqlConnection`.
-   It skips string literals, `@parameters`, already-bracketed names, qualified names
-   (`a.Key`), comments, and the `PRIMARY KEY` / `FOREIGN KEY` syntax.
-
-Bracketing is done on the **text that is executed**, not in the schema definitions. That
-detail matters: ScreenConnect compares `ColumnDefinition.ColumnName` against the live
-database to decide whether to `ALTER TABLE`. If the definitions said `[Key]` while SQL
-Server reports `Key`, it would try to add a duplicate column (`Msg 2705`). Keeping the
-definitions plain keeps that comparison happy.
-
-## Requirements
-
-- .NET 8 runtime to run the tool (`dotnet scpatch.dll`)
-- .NET Framework 4.x on the target (any ScreenConnect 26.x)
-- Mono's `mcs` or the .NET Framework compiler to rebuild the fixer (a prebuilt signed
-  `ScreenConnect.SqlFixer.dll` is included)
-
-## Usage
-
-```
-dotnet scpatch.dll report <in.dll> <out.tsv>
-dotnet scpatch.dll hook   <in.dll> <out.dll> --fixer <ScreenConnect.SqlFixer.dll>
-dotnet scpatch.dll patch  <in.dll> <out.dll> [--verbose] [--extra-ident NAME]
-dotnet scpatch.dll il     <dll> [type] [method] [count]
-```
-
-- `report` — decrypts the obfuscated string table and dumps every call site
-  (`type`, `method`, `kind`, `index`, `key`, `plain`). Useful to confirm the build is
-  recognisable before changing anything.
-- `hook` — **the recommended mode.** Injects the `SqlFixer.Fix(connection, sql)` call.
-- `patch` — legacy mode: rewrites the decrypted SQL strings themselves. Keeps schema
-  definitions intact but cannot reach SQL that is assembled at runtime from column
-  definitions (e.g. the `SELECT` column list), so `hook` is preferred.
-- `il` — dumps the first N IL instructions of a method plus the module's assembly refs.
-  Handy to verify the injection.
-
-### Patching a different ScreenConnect version
-
-1. Get the version that is **actually installed** — the patched file must match it or the
-   service fails with `FileLoadException`:
-
-   ```powershell
-   (Get-Item 'C:\Program Files (x86)\ScreenConnect\Bin\ScreenConnect.Server.dll').VersionInfo.FileVersion
-   ```
-
-2. Copy that DLL to a work folder.
-3. `dotnet scpatch.dll report ScreenConnect.Server.dll sites.tsv` — you should see the
-   `SecurityDatabase::.cctor` rows and ` WHERE Key = @A`; if the table resolves, the build
-   uses the same obfuscator.
-4. `dotnet scpatch.dll hook ScreenConnect.Server.dll out.dll --fixer ScreenConnect.SqlFixer.dll`
-5. Deploy (below).
-
-The tool locates the code by structure, not by offsets: it finds the `Lazy<string[]>[]`
-string table, the decryptor call sites, and `CreateCommand` by signature. That is what makes
-it portable across builds.
-
-## Deployment
-
-`deploy/install-patch.ps1` is a template — edit the two source paths at the top, then run it
-elevated. In short:
+`deploy\set-mssql-config.ps1 -SecuritySqlite` writes exactly that, keeping the SQLite string
+byte-for-byte as ScreenConnect installs it:
 
 ```powershell
-# stop all four (they share ONE process)
-'ScreenConnect Web Server','ScreenConnect Session Manager',
-'ScreenConnect Security Manager','ScreenConnect Relay' | Stop-Service -Force
-Start-Sleep 8
-
-Copy-Item .\ScreenConnect.Server.dll  'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
-Copy-Item .\ScreenConnect.SqlFixer.dll 'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
-
-# start again (one process serves all four roles)
-'ScreenConnect Security Manager','ScreenConnect Session Manager',
-'ScreenConnect Relay','ScreenConnect Web Server' | Start-Service
+.\set-mssql-config.ps1 -SecuritySqlite `
+  -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
 ```
 
-The patched assembly is loaded from `Bin` with the same identity (name, version, public key
-token) as the original, so nothing else needs to change.
+Copy `App_Data\Session.db` into SQL Server first with `sqlite2mssql.exe`; the security file
+stays where it is and needs no migration.
+
+Verified on a running install with the **stock, unpatched** `ScreenConnect.Server.dll`:
+`/` 200, `/Login` 200, relay up across the full tamper-check interval with zero restarts,
+21 agents connected, sessions updating.
+
+Things to keep in mind:
+
+- `App_Data\Security.db` is load-bearing again — it holds the DPAPI keys and the
+  `SecurityConfiguration` rows. Back it up, and copy it if you move the installation.
+- The SQL Server database used for security (`ScreenConnect_Security`) is no longer touched
+  and can be dropped.
+- After switching, the SQLite `Session.db` is ignored; keep it as a rollback.
+- Reports that query the session database still hit the shapes described under
+  "SQL Server report fixes" (`Msg 164`, `Msg 8117`), because those queries now run on SQL
+  Server. If you depend on those reports, patch; for agent, relay and web operation you do
+  not need to.
 
 ## Configuring web.config
 
@@ -199,49 +173,112 @@ Notes:
 - `tools\SqliteToMssql\build.ps1` rebuilds the executable with the in-box .NET Framework
   compiler if you prefer to compile it yourself.
 
-## Hybrid: SQL Server for sessions, SQLite for security
+## Full SQL Server: putting the security database on SQL Server
 
-This configuration needs **no patch at all**. The reserved-word problem (`Key` in
-`SecurityConfiguration`) lives in the security database, so leaving security on the original
-SQLite file avoids it, while the large database — sessions and events — moves to SQL Server.
+This is where the patch is needed. With the security database on SQL Server, every statement
+that touches `SecurityConfiguration.Key` is rejected (`Msg 156`), `ServerCryptoManager..ctor()`
+cannot load the application keys, and the site answers HTTP 500. The tool fixes that at the
+binary level and works on any ScreenConnect build with the same data layer.
 
-```xml
-<connectionStrings>
-  <add name="SessionDatabase"
-       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
-       providerName="System.Data.SqlClient" />
-  <add name="SecurityDatabase"
-       connectionString="Data Source=|DataDirectory|/Security.db; DateTimeKind=Utc; Foreign Keys=true; Page Size=4096; Journal Mode=WAL; BaseSchemaName=; Cache Size=1000; Memory Mapped Size=10000000000; DateTimeFormat=Ticks"
-       providerName="SQLite" />
-</connectionStrings>
+Follow the same web.config and migration steps as above, then patch before starting:
+
+1. `set-mssql-config.ps1` with both connection strings on `System.Data.SqlClient`.
+2. `sqlite2mssql.exe` for `Session.db` **and** `Security.db`.
+3. `scpatch hook` against the installed `ScreenConnect.Server.dll`, and copy the result plus
+   `ScreenConnect.SqlFixer.dll` into `Bin` (see Deployment below).
+4. Start the services and check `/` and `/Login`.
+
+If you only need the report SQL rewritten and the security database can stay on SQLite, stay
+with the hybrid and skip this section.
+
+
+### How it works
+
+Two pieces, both dropped into `Bin`:
+
+1. **`ScreenConnect.Server.dll` (patched)** — one `call` is injected at the top of
+   `ScreenConnect.DbExtensions.CreateCommand(DbConnection, string, object[])`. In this
+   assembly that method contains the *only* `DbCommand.CommandText` assignment, so every
+   SQL statement in the product passes through it.
+
+2. **`ScreenConnect.SqlFixer.dll` (helper)** — takes that SQL text and brackets reserved
+   identifiers (`Key`, `Value`) when — and only when — the connection is a `SqlConnection`.
+   It skips string literals, `@parameters`, already-bracketed names, qualified names
+   (`a.Key`), comments, and the `PRIMARY KEY` / `FOREIGN KEY` syntax.
+
+Bracketing is done on the **text that is executed**, not in the schema definitions. That
+detail matters: ScreenConnect compares `ColumnDefinition.ColumnName` against the live
+database to decide whether to `ALTER TABLE`. If the definitions said `[Key]` while SQL
+Server reports `Key`, it would try to add a duplicate column (`Msg 2705`). Keeping the
+definitions plain keeps that comparison happy.
+
+### Requirements
+
+- .NET 8 runtime to run the tool (`dotnet scpatch.dll`)
+- .NET Framework 4.x on the target (any ScreenConnect 26.x)
+- Mono's `mcs` or the .NET Framework compiler to rebuild the fixer (a prebuilt signed
+  `ScreenConnect.SqlFixer.dll` is included)
+
+### Usage
+
+```
+dotnet scpatch.dll report <in.dll> <out.tsv>
+dotnet scpatch.dll hook   <in.dll> <out.dll> --fixer <ScreenConnect.SqlFixer.dll>
+dotnet scpatch.dll patch  <in.dll> <out.dll> [--verbose] [--extra-ident NAME]
+dotnet scpatch.dll il     <dll> [type] [method] [count]
 ```
 
-`deploy\set-mssql-config.ps1 -SecuritySqlite` writes exactly that, keeping the SQLite string
-byte-for-byte as ScreenConnect installs it:
+- `report` — decrypts the obfuscated string table and dumps every call site
+  (`type`, `method`, `kind`, `index`, `key`, `plain`). Useful to confirm the build is
+  recognisable before changing anything.
+- `hook` — **the recommended mode.** Injects the `SqlFixer.Fix(connection, sql)` call.
+- `patch` — legacy mode: rewrites the decrypted SQL strings themselves. Keeps schema
+  definitions intact but cannot reach SQL that is assembled at runtime from column
+  definitions (e.g. the `SELECT` column list), so `hook` is preferred.
+- `il` — dumps the first N IL instructions of a method plus the module's assembly refs.
+  Handy to verify the injection.
+
+#### Patching a different ScreenConnect version
+
+1. Get the version that is **actually installed** — the patched file must match it or the
+   service fails with `FileLoadException`:
+
+   ```powershell
+   (Get-Item 'C:\Program Files (x86)\ScreenConnect\Bin\ScreenConnect.Server.dll').VersionInfo.FileVersion
+   ```
+
+2. Copy that DLL to a work folder.
+3. `dotnet scpatch.dll report ScreenConnect.Server.dll sites.tsv` — you should see the
+   `SecurityDatabase::.cctor` rows and ` WHERE Key = @A`; if the table resolves, the build
+   uses the same obfuscator.
+4. `dotnet scpatch.dll hook ScreenConnect.Server.dll out.dll --fixer ScreenConnect.SqlFixer.dll`
+5. Deploy (below).
+
+The tool locates the code by structure, not by offsets: it finds the `Lazy<string[]>[]`
+string table, the decryptor call sites, and `CreateCommand` by signature. That is what makes
+it portable across builds.
+
+### Deployment
+
+`deploy/install-patch.ps1` is a template — edit the two source paths at the top, then run it
+elevated. In short:
 
 ```powershell
-.\set-mssql-config.ps1 -SecuritySqlite `
-  -SessionConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;User ID=CWControl;Password=CHANGE-ME;MultipleActiveResultSets=True;TrustServerCertificate=True"
+# stop all four (they share ONE process)
+'ScreenConnect Web Server','ScreenConnect Session Manager',
+'ScreenConnect Security Manager','ScreenConnect Relay' | Stop-Service -Force
+Start-Sleep 8
+
+Copy-Item .\ScreenConnect.Server.dll  'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
+Copy-Item .\ScreenConnect.SqlFixer.dll 'C:\Program Files (x86)\ScreenConnect\Bin\' -Force
+
+# start again (one process serves all four roles)
+'ScreenConnect Security Manager','ScreenConnect Session Manager',
+'ScreenConnect Relay','ScreenConnect Web Server' | Start-Service
 ```
 
-Copy `App_Data\Session.db` into SQL Server first with `sqlite2mssql.exe`; the security file
-stays where it is and needs no migration.
-
-Verified on a running install with the **stock, unpatched** `ScreenConnect.Server.dll`:
-`/` 200, `/Login` 200, relay up across the full tamper-check interval with zero restarts,
-21 agents connected, sessions updating.
-
-Things to keep in mind:
-
-- `App_Data\Security.db` is load-bearing again — it holds the DPAPI keys and the
-  `SecurityConfiguration` rows. Back it up, and copy it if you move the installation.
-- The SQL Server database used for security (`ScreenConnect_Security`) is no longer touched
-  and can be dropped.
-- After switching, the SQLite `Session.db` is ignored; keep it as a rollback.
-- Reports that query the session database still hit the shapes described under
-  "SQL Server report fixes" (`Msg 164`, `Msg 8117`), because those queries now run on SQL
-  Server. If you depend on those reports, patch; for agent, relay and web operation you do
-  not need to.
+The patched assembly is loaded from `Bin` with the same identity (name, version, public key
+token) as the original, so nothing else needs to change.
 
 ## SQL Server checklist
 

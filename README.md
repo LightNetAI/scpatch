@@ -99,6 +99,80 @@ Copy-Item .\ScreenConnect.SqlFixer.dll 'C:\Program Files (x86)\ScreenConnect\Bin
 The patched assembly is loaded from `Bin` with the same identity (name, version, public key
 token) as the original, so nothing else needs to change.
 
+## Configuring web.config
+
+Both connection strings need a matching `providerName`. `System.Data.SqlClient` is the
+invariant name of the built-in SQL Server provider:
+
+```xml
+<connectionStrings>
+  <add name="SessionDatabase"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True"
+       providerName="System.Data.SqlClient" />
+  <add name="SecurityDatabase"
+       connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True"
+       providerName="System.Data.SqlClient" />
+</connectionStrings>
+```
+
+`deploy\set-mssql-config.ps1` performs that edit safely. The four ScreenConnect services share
+one process and hold `web.config` open, so it stops them, writes a timestamped backup, writes
+to a temporary file and moves it into place (a direct write can leave a zero-byte
+`web.config`), restarts, and reports health:
+
+```powershell
+.\set-mssql-config.ps1 -WhatIf `
+  -SessionConnectionString  "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
+  -SecurityConnectionString "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True"
+```
+
+Drop `-WhatIf` to apply. `-KeepServicesStopped` leaves them down for a follow-up step.
+
+## Migrating an existing SQLite database
+
+`tools\SqliteToMssql\sqlite2mssql.exe` copies `App_Data\Session.db` and
+`App_Data\Security.db` into SQL Server. It reads SQLite through the provider ScreenConnect
+ships inside `ScreenConnect.Server.dll` (loaded by reflection), so there is nothing to
+download and no `sqlite3.dll` to install — only an existing ScreenConnect installation.
+
+```powershell
+# stop the four services first
+.\sqlite2mssql.exe --db "C:\Program Files (x86)\ScreenConnect\App_Data\Session.db" `
+    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect;Integrated Security=True;TrustServerCertificate=True" `
+    --create-database
+
+.\sqlite2mssql.exe --db "C:\Program Files (x86)\ScreenConnect\App_Data\Security.db" `
+    --target "Data Source=.\SQLEXPRESS;Initial Catalog=ScreenConnect_Security;Integrated Security=True;TrustServerCertificate=True" `
+    --create-database
+```
+
+It creates the database when missing, creates missing tables with SQL Server types
+(`nvarchar(max)` for free text, `nvarchar(450)` / `nvarchar(200)` for primary-key columns
+because SQL Server cannot index `nvarchar(max)`, `datetime2`, `varbinary(max)`), copies with
+`SqlBulkCopy`, then adds the foreign keys with `ON DELETE CASCADE`, and finishes with a
+row-count comparison per table:
+
+```
+table                    sqlite    mssql   ok
+Session                       60       60   yes
+SessionConnection           3219     3219   yes
+SessionCustomProperty        480      480   yes
+SessionEvent                6672     6672   yes
+```
+
+Other switches: `--truncate` clears existing rows first, `--dry-run` prints the plan without
+changing anything, `--batch <n>` tunes the bulk-copy batch (default 2000), `--server-dll`
+points at a ScreenConnect installation in a non-default location.
+
+Notes:
+
+- ScreenConnect stores datetimes as **.NET ticks** in SQLite; the tool converts them to
+  `datetime2`. `0001-01-01` sentinels survive, which `datetime` (1753 minimum) would reject.
+- The two `SecurityConfiguration` rows are DPAPI blobs bound to the machine. Migrate on the
+  machine that will run the server, otherwise the encrypted settings cannot be read.
+- `tools\SqliteToMssql\build.ps1` rebuilds the executable with the in-box .NET Framework
+  compiler if you prefer to compile it yourself.
+
 ## SQL Server checklist
 
 Two things outside the DLL are easy to miss, and both fail in ways that look unrelated.

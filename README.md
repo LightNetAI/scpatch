@@ -271,6 +271,37 @@ declaring a build good.
 - **Diagnostics.** The fixer logs every rewrite to `C:\Temp\scsqlfix.log`, but only when the
   marker file `C:\Temp\scsqlfix.enable` exists. Delete the marker to go quiet.
 
+## What the tamper check actually does
+
+It does **not** report anything to ConnectWise. The reaction is entirely local:
+
+1. `HaveFilesBeenTamperedWith()` hashes `ScreenConnect.*.dll` against the encrypted manifest
+   shipped with the install and caches the answer in an `AsyncLazy<bool>`. The only strings in
+   that method are `ScreenConnect.*.dll` and `-`.
+2. `SessionManager.RunTamperingCheckAsync` runs on a timer (`ServerConstants.CheckTamperingInterval`,
+   a few minutes). When the check trips it calls `LicenseManager.RemoveLicense` for every loaded
+   license, and raises a `SessionManagerFaultType.TamperingCheck` service fault. `RemoveLicense`
+   goes to `AlterLicensesAndSave` → `LoadLicenseEnvelopes` / `GetLicenseFilePath` / `SerializeXml`
+   — the local license file, no network.
+3. The check gates four local entry points: the relay accept loop, the generic socket server
+   accept loop, the installer handler and the launch handler. They all consult the same cached
+   boolean and decline to serve.
+
+The single hard-coded external host in the server assembly is
+`https://api.labtechsoftware.com/v1/licensing/screenconnect/validate` (LabTech/Automate
+licensing). The other outbound code is licensing, cloud configuration, extension hosting and
+activity tracing. The license telemetry that does leave the machine carries
+`LicenseIDHash`, `LicenseIDHashSignature`, `EncryptedFingerprint`,
+`SignatureCertificateChainPemString` and `SignatureHashAlgorithmName` — license identity, never
+file hashes and never a tampered flag. The revocation check sends `InstanceCode`,
+`LicenseIDHash` and `ClientSecret`.
+
+So the practical consequence of a patched DLL is that the server **deletes its own licence** and
+records a fault, which is exactly what `scpatch hook` neutralises. The only indirect signal is
+that a licence the server removed locally stops validating — a consequence of the local
+removal, not a report about modified files. In the hybrid layout above nothing fires at all,
+because the DLL is stock.
+
 ## Verified on
 
 - ScreenConnect 26.6.6.9747, Windows Server 2025

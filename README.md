@@ -311,6 +311,18 @@ launch.
 then stays up. Because the check is timer-driven, test for at least five minutes before
 declaring a build good.
 
+## Putting web and relay on port 443
+
+If agents are blocked on outbound 8041, the built-in (and unsupported) Router service can put the
+web server and the relay behind a single port 443, splitting connections by sniffing the TLS
+ClientHello versus the ScreenConnect relay hello. It is a `web.config` section plus a service that
+ships disabled — the usual reason it "doesn't work" is that the service was never re-enabled, or
+that the web server was left on plain HTTP so the router forwards TLS at an HTTP listener.
+
+Full walkthrough, including the certificate binding, the SNI caveat and the rollback:
+[docs/screenconnect-router-443.md](docs/screenconnect-router-443.md), with a tested script at
+[deploy/setup-router-443.ps1](deploy/setup-router-443.ps1).
+
 ## Notes and caveats
 
 - **Strong name.** `ScreenConnect.Server.dll` is strong-named; rewriting it invalidates the
